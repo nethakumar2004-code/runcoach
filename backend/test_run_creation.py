@@ -92,11 +92,11 @@ def test_run_creation():
             db.add(test_run)
         
         db.commit()
-        print(f"✅ {len(test_runs)} test runs created successfully!")
+        print(f"{len(test_runs)} test runs created successfully!")
         
         # Test querying runs
         all_runs = db.query(CompletedRun).filter(CompletedRun.user_id == test_user.id).all()
-        print(f"✅ Total runs for user: {len(all_runs)}")
+        print(f"Total runs for user: {len(all_runs)}")
         
         # Show recent runs (last 30 days)
         thirty_days_ago = datetime.utcnow() - timedelta(days=30)
@@ -104,14 +104,14 @@ def test_run_creation():
             CompletedRun.user_id == test_user.id,
             CompletedRun.start_datetime >= thirty_days_ago
         ).all()
-        print(f"✅ Recent runs (last 30 days): {len(recent_runs)}")
+        print(f"Recent runs (last 30 days): {len(recent_runs)}")
         
         # Show run details
         for run in recent_runs:
             print(f"  - {run.distance_km}km in {run.duration_sec}s on {run.start_datetime.strftime('%Y-%m-%d')}")
             
     except Exception as e:
-        print(f"❌ Error creating test runs: {e}")
+        print(f"ERROR: Error creating test runs: {e}")
         import traceback
         traceback.print_exc()
         db.rollback()

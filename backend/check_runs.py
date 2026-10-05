@@ -16,7 +16,7 @@ def check_runs():
         # Get test user
         test_user = db.query(User).filter(User.email == "test@example.com").first()
         if not test_user:
-            print("❌ Test user not found")
+            print("ERROR: Test user not found")
             return
         
         print(f"Test user: {test_user.id} ({test_user.email})")
@@ -29,7 +29,7 @@ def check_runs():
             print(f"{i}. {run.distance_km}km in {run.duration_sec}s on {run.start_datetime} (pace: {run.avg_pace_s_per_km:.0f}s/km)")
             
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"ERROR: Error: {e}")
         import traceback
         traceback.print_exc()
     finally:

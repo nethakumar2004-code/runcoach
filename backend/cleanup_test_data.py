@@ -80,7 +80,7 @@ def cleanup_test_data():
             print("No real runs found. All data was test data.")
             
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"ERROR: Error: {e}")
         import traceback
         traceback.print_exc()
         db.rollback()

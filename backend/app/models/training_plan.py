@@ -28,9 +28,11 @@ class TrainingPlan(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-    # Note: Relationships commented out to avoid circular import issues
-    # workouts = relationship("TrainingWorkout", back_populates="training_plan", cascade="all, delete-orphan")
-    # user_plans = relationship("UserTrainingPlan", back_populates="training_plan")
+    workouts = relationship(
+        "TrainingWorkout",
+        cascade="all, delete-orphan",
+        order_by=lambda: (TrainingWorkout.week_number, TrainingWorkout.day_number),
+    )
 
 class TrainingWorkout(Base):
     __tablename__ = "training_workouts"
@@ -46,9 +48,6 @@ class TrainingWorkout(Base):
     intensity_level = Column(Integer, default=1)  # 1-10 scale
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    # Note: Relationships commented out to avoid circular import issues
-    # training_plan = relationship("TrainingPlan", back_populates="workouts")
-    # user_workouts = relationship("UserWorkoutCompletion", back_populates="workout")
 
 class UserTrainingPlan(Base):
     __tablename__ = "user_training_plans"
@@ -62,10 +61,8 @@ class UserTrainingPlan(Base):
     completed_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    # Note: Relationships commented out to avoid circular import issues
-    # user = relationship("User", back_populates="training_plans")
-    # training_plan = relationship("TrainingPlan", back_populates="user_plans")
-    # workout_completions = relationship("UserWorkoutCompletion", back_populates="user_plan")
+    # The routers and response schemas read user_plan.training_plan, so this relationship is required
+    training_plan = relationship("TrainingPlan")
 
 class UserWorkoutCompletion(Base):
     __tablename__ = "user_workout_completions"
@@ -79,6 +76,4 @@ class UserWorkoutCompletion(Base):
     effort_rating = Column(Integer)  # 1-10 scale
     notes = Column(Text)
 
-    # Note: Relationships commented out to avoid circular import issues
-    # user_plan = relationship("UserTrainingPlan", back_populates="workout_completions")
-    # workout = relationship("TrainingWorkout", back_populates="user_workouts")
+    workout = relationship("TrainingWorkout")

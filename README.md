@@ -96,18 +96,27 @@ cd backend
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies (requirements-dev.txt also installs the test tools)
+pip install -r requirements-dev.txt
 
-# Initialize database
-python init_db.py
+# Optional: copy the example settings and fill them in
+cp .env.example .env  # On Windows: copy .env.example .env
 
-# Populate sample data
+# Populate sample training plans (tables are created automatically)
 python populate_training_plans.py
 
 # Start the server
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+The database is always `backend/dev.db`, no matter which folder you start the server from.
+
+### Running the tests
+```bash
+cd backend
+pytest
+```
+Run the tests before every commit. Each bug that has been fixed has a test, so if one comes back you'll know straight away.
 
 ### Mobile App Setup
 ```bash
@@ -128,14 +137,15 @@ npx expo run:android
 ```
 
 ### Environment Configuration
-Create `.env` files in both backend and mobile directories:
+All backend settings are optional and documented in `backend/.env.example`. The important ones:
 
-**Backend `.env`:**
-```
-DATABASE_URL=sqlite:///./dev.db
-SECRET_KEY=your-secret-key-here
-WEATHER_API_KEY=your-openweather-api-key
-```
+| Setting | What it does |
+|---|---|
+| `SECRET_KEY` | Signs login tokens. If unset, a random key is generated once into `backend/.secret_key` (git-ignored). |
+| `OPENWEATHER_API_KEY` | Live weather. Without it, weather endpoints return sample data marked `is_mock: true`. |
+| `ADMIN_EMAILS` | Comma-separated emails allowed to create training plans through the API. |
+| `RUNCOACH_DEV_MODE=1` | Enables the `dev-token` login used by the mobile debug screen and the `/training-plans` debug endpoints. **Never enable on a public server** - anyone could log in as the test user. |
+| `DATABASE_URL` | Use a different database. |
 
 **Mobile `.env`:**
 ```

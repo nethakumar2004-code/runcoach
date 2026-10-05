@@ -1,11 +1,14 @@
+import logging
+from typing import List
+from datetime import timedelta, timezone, datetime
+
+import requests
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from typing import List, Optional
-from datetime import datetime, timedelta
-import requests
-import os
 
+from app import config
 from app.db import get_db
+from app.models.run import CompletedRun
 from app.models.user import User
 from app.models.weather import WeatherData, WeatherAlert
 from app.schemas.weather import (
@@ -18,89 +21,87 @@ from app.schemas.weather import (
     WeatherHistoryResponse
 )
 from app.dependencies import get_current_user
+from app.timeutils import utcnow
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/weather", tags=["weather"])
 
-# You'll need to set this environment variable or get an API key from OpenWeatherMap
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "your_api_key_here")
+OPENWEATHER_URL = "https://api.openweathermap.org/data/2.5"
+REQUEST_TIMEOUT_SECONDS = 5
 
+
+def _weather_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Weather service is unavailable right now. Please try again later.",
+    )
+
+
+def _fetch(endpoint: str, lat: float, lon: float) -> dict:
+    """Call OpenWeatherMap. Raises 503 instead of silently returning made-up weather."""
+    try:
+        response = requests.get(
+            f"{OPENWEATHER_URL}/{endpoint}",
+            params={"lat": lat, "lon": lon, "appid": config.OPENWEATHER_API_KEY, "units": "metric"},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+    except (requests.RequestException, ValueError):
+        logger.exception("OpenWeatherMap %s request failed", endpoint)
+        raise _weather_unavailable()
+
+
+# Plain `def` (not `async def`): FastAPI runs these in a thread pool, so a slow
+# weather API no longer blocks every other request on the server.
 @router.get("/current", response_model=CurrentWeatherResponse)
-async def get_current_weather(
-    lat: float = Query(..., description="Latitude"),
-    lon: float = Query(..., description="Longitude"),
+def get_current_weather(
+    lat: float = Query(..., ge=-90, le=90, description="Latitude"),
+    lon: float = Query(..., ge=-180, le=180, description="Longitude"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """Get current weather for a location"""
-    try:
-        # Fetch from OpenWeatherMap API
-        url = f"https://api.openweathermap.org/data/2.5/weather"
-        params = {
-            "lat": lat,
-            "lon": lon,
-            "appid": OPENWEATHER_API_KEY,
-            "units": "metric"
-        }
-        
-        response = requests.get(url, params=params)
-        
-        if response.status_code != 200:
-            # Fallback to mock data for development
-            weather_data = create_mock_weather_data(lat, lon)
-        else:
-            data = response.json()
+    is_mock = config.OPENWEATHER_API_KEY is None
+    if is_mock:
+        weather_data = create_mock_weather_data(lat, lon)
+    else:
+        data = _fetch("weather", lat, lon)
+        try:
             weather_data = WeatherDataCreate(
                 latitude=lat,
                 longitude=lon,
                 temperature=data["main"]["temp"],
                 feels_like=data["main"]["feels_like"],
                 humidity=data["main"]["humidity"],
-                wind_speed=data["wind"]["speed"],
-                wind_direction=data["wind"]["deg"],
+                wind_speed=data.get("wind", {}).get("speed", 0),
+                wind_direction=data.get("wind", {}).get("deg", 0),
                 weather_condition=data["weather"][0]["main"],
                 weather_description=data["weather"][0]["description"],
                 weather_icon=data["weather"][0]["icon"],
                 visibility=data.get("visibility", 10000) / 1000,  # Convert to km
                 pressure=data["main"].get("pressure"),
-                location_name=data.get("name", "Unknown Location")
+                location_name=data.get("name") or "Unknown Location"
             )
-        
-        # Save weather data to database
-        db_weather = WeatherData(**weather_data.dict())
-        db.add(db_weather)
-        db.commit()
-        db.refresh(db_weather)
-        
-        # Generate running recommendation
-        recommendation = generate_running_recommendation(weather_data)
-        
-        # Check for user alerts
-        alerts = check_weather_alerts(db, current_user.id, weather_data)
-        
-        return CurrentWeatherResponse(
-            weather=db_weather,
-            recommendation=recommendation,
-            alerts=alerts
-        )
-        
-    except Exception as e:
-        # Fallback to mock data
-        weather_data = create_mock_weather_data(lat, lon)
-        db_weather = WeatherData(**weather_data.dict())
-        db.add(db_weather)
-        db.commit()
-        db.refresh(db_weather)
-        
-        recommendation = generate_running_recommendation(weather_data)
-        
-        return CurrentWeatherResponse(
-            weather=db_weather,
-            recommendation=recommendation,
-            alerts=[]
-        )
+        except (KeyError, IndexError, TypeError, ValueError):
+            logger.exception("Unexpected OpenWeatherMap response")
+            raise _weather_unavailable()
+
+    now = utcnow()
+    recommendation = generate_running_recommendation(weather_data)
+    if is_mock:
+        recommendation["message"] = "Sample weather - live weather is not configured on the server"
+
+    return CurrentWeatherResponse(
+        weather=WeatherDataSchema(**weather_data.model_dump(), recorded_at=now, created_at=now),
+        recommendation=recommendation,
+        alerts=check_weather_alerts(db, current_user.id, weather_data),
+        is_mock=is_mock,
+    )
 
 def create_mock_weather_data(lat: float, lon: float) -> WeatherDataCreate:
-    """Create mock weather data for development/fallback"""
+    """Clearly labelled sample data for development without an API key"""
     return WeatherDataCreate(
         latitude=lat,
         longitude=lon,
@@ -110,12 +111,12 @@ def create_mock_weather_data(lat: float, lon: float) -> WeatherDataCreate:
         wind_speed=3.2,
         wind_direction=180,
         weather_condition="Clear",
-        weather_description="clear sky",
+        weather_description="sample data (no API key)",
         weather_icon="01d",
         visibility=10.0,
         uv_index=5.0,
         pressure=1013.25,
-        location_name="Current Location"
+        location_name="Sample weather (no API key)"
     )
 
 def generate_running_recommendation(weather: WeatherDataCreate) -> dict:
@@ -219,84 +220,68 @@ def check_weather_alerts(db: Session, user_id: str, weather: WeatherDataCreate) 
     return triggered_alerts
 
 @router.get("/forecast", response_model=List[WeatherForecast])
-async def get_weather_forecast(
-    lat: float = Query(..., description="Latitude"),
-    lon: float = Query(..., description="Longitude"),
-    days: int = Query(5, description="Number of days (1-5)")
+def get_weather_forecast(
+    lat: float = Query(..., ge=-90, le=90, description="Latitude"),
+    lon: float = Query(..., ge=-180, le=180, description="Longitude"),
+    days: int = Query(5, ge=1, le=5, description="Number of days (1-5)")
 ):
     """Get weather forecast for the next few days"""
+    if config.OPENWEATHER_API_KEY is None:
+        return create_mock_forecast(days)
+
+    data = _fetch("forecast", lat, lon)
     try:
-        url = f"https://api.openweathermap.org/data/2.5/forecast"
-        params = {
-            "lat": lat,
-            "lon": lon,
-            "appid": OPENWEATHER_API_KEY,
-            "units": "metric"
-        }
-        
-        response = requests.get(url, params=params)
-        
-        if response.status_code != 200:
-            # Return mock forecast data
-            return create_mock_forecast(days)
-        
-        data = response.json()
-        forecast = []
-        
-        # Group by day and get daily summary
+        # Group the 3-hourly entries by the location's local date, not the UTC date
+        offset = timedelta(seconds=data.get("city", {}).get("timezone", 0))
         daily_data = {}
-        for item in data["list"][:days * 8]:  # 8 forecasts per day (3-hour intervals)
-            date = item["dt_txt"].split(" ")[0]
-            if date not in daily_data:
-                daily_data[date] = []
-            daily_data[date].append(item)
-        
+        for item in data["list"]:
+            local_date = (datetime.fromtimestamp(item["dt"], tz=timezone.utc) + offset).strftime("%Y-%m-%d")
+            daily_data.setdefault(local_date, []).append(item)
+
+        forecast = []
         for date, day_items in list(daily_data.items())[:days]:
             temps = [item["main"]["temp"] for item in day_items]
             conditions = [item["weather"][0] for item in day_items]
-            
-            # Get most common condition
+
             condition_counts = {}
             for cond in conditions:
-                key = cond["main"]
-                condition_counts[key] = condition_counts.get(key, 0) + 1
-            most_common = max(condition_counts.items(), key=lambda x: x[1])
-            
+                condition_counts[cond["main"]] = condition_counts.get(cond["main"], 0) + 1
+            most_common = max(condition_counts.items(), key=lambda x: x[1])[0]
+            representative = next(c for c in conditions if c["main"] == most_common)
+
             forecast.append(WeatherForecast(
                 date=date,
                 temperature_min=min(temps),
                 temperature_max=max(temps),
-                weather_condition=most_common[0],
-                weather_description=conditions[0]["description"],
-                weather_icon=conditions[0]["icon"],
-                precipitation_probability=day_items[0].get("pop", 0) * 100,
-                wind_speed=day_items[0]["wind"]["speed"]
+                weather_condition=most_common,
+                weather_description=representative["description"],
+                weather_icon=representative["icon"],
+                # Worst case of the day, not just the first 3-hour slot
+                precipitation_probability=max(item.get("pop", 0) for item in day_items) * 100,
+                wind_speed=max(item.get("wind", {}).get("speed", 0) for item in day_items)
             ))
-        
         return forecast
-        
-    except Exception as e:
-        return create_mock_forecast(days)
+    except (KeyError, IndexError, TypeError, ValueError):
+        logger.exception("Unexpected OpenWeatherMap forecast response")
+        raise _weather_unavailable()
 
 def create_mock_forecast(days: int) -> List[WeatherForecast]:
-    """Create mock forecast data"""
-    forecast = []
-    base_date = datetime.now()
-    
-    for i in range(days):
-        date = (base_date + timedelta(days=i)).strftime("%Y-%m-%d")
-        forecast.append(WeatherForecast(
-            date=date,
+    """Clearly labelled sample forecast for development without an API key"""
+    base_date = utcnow()
+    return [
+        WeatherForecast(
+            date=(base_date + timedelta(days=i)).strftime("%Y-%m-%d"),
             temperature_min=18 + i,
             temperature_max=25 + i,
             weather_condition="Clear",
-            weather_description="clear sky",
+            weather_description="sample data (no API key)",
             weather_icon="01d",
             precipitation_probability=10 + i * 5,
-            wind_speed=3.0 + i * 0.5
-        ))
-    
-    return forecast
+            wind_speed=3.0 + i * 0.5,
+            is_mock=True,
+        )
+        for i in range(days)
+    ]
 
 @router.post("/alerts", response_model=WeatherAlertSchema)
 def create_weather_alert(
@@ -307,7 +292,7 @@ def create_weather_alert(
     """Create a weather alert for the user"""
     db_alert = WeatherAlert(
         user_id=current_user.id,
-        **alert.dict()
+        **alert.model_dump()
     )
     db.add(db_alert)
     db.commit()
@@ -349,18 +334,21 @@ def delete_weather_alert(
 
 @router.get("/history", response_model=WeatherHistoryResponse)
 def get_weather_history(
-    days: int = Query(30, description="Number of days to look back"),
+    days: int = Query(30, ge=1, le=365, description="Number of days to look back"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Get weather history for user's runs"""
-    start_date = datetime.now() - timedelta(days=days)
-    
-    weather_data = db.query(WeatherData).filter(
+    """Get weather history for the current user's runs"""
+    start_date = utcnow() - timedelta(days=days)
+
+    # Join through the runs table so users only ever see weather attached to their OWN runs
+    weather_data = db.query(WeatherData).join(
+        CompletedRun, WeatherData.run_id == CompletedRun.id
+    ).filter(
+        CompletedRun.user_id == current_user.id,
         WeatherData.created_at >= start_date,
-        WeatherData.run_id.isnot(None)  # Only weather data associated with runs
     ).all()
-    
+
     if not weather_data:
         return WeatherHistoryResponse(
             weather_data=[],
@@ -368,21 +356,15 @@ def get_weather_history(
             most_common_condition="Unknown",
             total_records=0
         )
-    
-    # Calculate statistics
+
     temperatures = [w.temperature for w in weather_data]
-    conditions = [w.weather_condition for w in weather_data]
-    
-    avg_temp = sum(temperatures) / len(temperatures)
-    
     condition_counts = {}
-    for condition in conditions:
-        condition_counts[condition] = condition_counts.get(condition, 0) + 1
-    most_common_condition = max(condition_counts.items(), key=lambda x: x[1])[0]
-    
+    for w in weather_data:
+        condition_counts[w.weather_condition] = condition_counts.get(w.weather_condition, 0) + 1
+
     return WeatherHistoryResponse(
         weather_data=weather_data,
-        average_temperature=round(avg_temp, 1),
-        most_common_condition=most_common_condition,
+        average_temperature=round(sum(temperatures) / len(temperatures), 1),
+        most_common_condition=max(condition_counts.items(), key=lambda x: x[1])[0],
         total_records=len(weather_data)
     )

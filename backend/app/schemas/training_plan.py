@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
 from enum import Enum
@@ -74,10 +74,10 @@ class UserTrainingPlan(UserTrainingPlanBase):
         from_attributes = True
 
 class WorkoutCompletionBase(BaseModel):
-    actual_duration_minutes: Optional[int] = None
-    actual_distance_km: Optional[float] = None
-    effort_rating: Optional[int] = None
-    notes: Optional[str] = None
+    actual_duration_minutes: Optional[int] = Field(default=None, ge=0, le=24 * 60)
+    actual_distance_km: Optional[float] = Field(default=None, ge=0, le=500)
+    effort_rating: Optional[int] = Field(default=None, ge=1, le=10)
+    notes: Optional[str] = Field(default=None, max_length=5000)
 
 class WorkoutCompletionCreate(WorkoutCompletionBase):
     pass

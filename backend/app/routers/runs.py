@@ -1,6 +1,9 @@
+import logging
+import uuid
+from datetime import datetime
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -8,8 +11,17 @@ from app.models.run import CompletedRun
 from app.models.user import User
 from app.schemas.run import RunCreate, RunResponse, RunListItem, RunDetail
 from app.dependencies import get_current_user
+from app.services.achievements import check_and_award_achievements
+from app.services.social import record_activity, update_challenge_progress
+from app.services.training import rolling_loads, run_load, session_load
+from app.timeutils import utcnow
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Slower than 30 min/km means the watch was left running; cap it so averages aren't wrecked
+MAX_PACE_S_PER_KM = 1800
 
 
 def calculate_calories_burned(
@@ -86,178 +98,105 @@ def create_run(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Distance, duration, RPE, heart rate and pace ranges are already validated by RunCreate
+    avg_pace = min(run_in.duration_sec / run_in.distance_km, MAX_PACE_S_PER_KM)
+    load = session_load(run_in.duration_sec, run_in.rpe)
+
+    gps_route_json = [
+        {
+            "lat": point.lat,
+            "lng": point.lng,
+            "timestamp": point.timestamp.isoformat(),
+            "elevation": point.elevation,
+            "speed": point.speed
+        }
+        for point in run_in.gps_route
+    ]
+    start_location_json = run_in.start_location.model_dump() if run_in.start_location else None
+    end_location_json = run_in.end_location.model_dump() if run_in.end_location else None
+    hr_data_json = [
+        {"bpm": point.bpm, "timestamp": point.timestamp.isoformat(), "zone": point.zone}
+        for point in run_in.hr_data
+    ]
+
+    avg_hr = max_hr = min_hr = hr_zones = None
+    if run_in.hr_data:
+        bpms = [point.bpm for point in run_in.hr_data]
+        avg_hr = int(sum(bpms) / len(bpms))
+        max_hr = max(bpms)
+        min_hr = min(bpms)
+        hr_zones = {}
+        for point in run_in.hr_data:  # samples per zone
+            hr_zones[point.zone] = hr_zones.get(point.zone, 0) + 1
+
+    calories_burned = calculate_calories_burned(
+        distance_km=run_in.distance_km,
+        duration_sec=run_in.duration_sec,
+        weight_kg=run_in.weight_kg or 70.0,
+        avg_hr=avg_hr or run_in.avg_hr,
+        elevation_gain_m=run_in.elevation_gain_m
+    )
+
+    db_run = CompletedRun(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        planned_workout_id=run_in.planned_workout_id,
+        start_datetime=run_in.start_datetime,
+        distance_km=run_in.distance_km,
+        duration_sec=run_in.duration_sec,
+        avg_pace_s_per_km=avg_pace,
+        avg_hr=avg_hr or run_in.avg_hr,
+        rpe=run_in.rpe,
+        avg_cadence_spm=run_in.avg_cadence_spm,
+        notes=run_in.notes or "",
+        training_load=load,
+        calories_burned=calories_burned,
+        gps_route=gps_route_json,
+        start_location=start_location_json,
+        end_location=end_location_json,
+        elevation_gain_m=run_in.elevation_gain_m,
+        max_speed_kmh=run_in.max_speed_kmh,
+        hr_data=hr_data_json,
+        max_hr=max_hr or run_in.max_hr,
+        min_hr=min_hr or run_in.min_hr,
+        hr_zones=hr_zones,
+        splits=[split.model_dump() for split in run_in.splits],
+    )
+    db.add(db_run)
+    record_activity(db, current_user.id, "run_completed", {
+        "run_id": db_run.id,
+        "distance_km": round(run_in.distance_km, 2),
+        "duration_sec": run_in.duration_sec,
+        "avg_pace_s_per_km": round(avg_pace, 1),
+    })
+    db.commit()
+    logger.info("Run %s saved for user %s (%.2f km)", db_run.id, current_user.id, run_in.distance_km)
+
+    # The run is saved at this point. Achievements and challenges are extras: if they fail,
+    # log it and still tell the app the save worked, so it doesn't retry and save the run twice.
+    new_achievements = []
     try:
-        # Validate input data
-        if run_in.distance_km < 0:
-            raise ValueError("Distance cannot be negative")
-        if run_in.duration_sec <= 0:
-            raise ValueError("Duration must be positive")
-        
-        # Minimum distance validation (at least 10 meters to avoid GPS noise)
-        min_distance_km = 0.01  # 10 meters
-        if run_in.distance_km < min_distance_km:
-            print(f"Warning: Very small distance detected: {run_in.distance_km} km. Setting to minimum {min_distance_km} km")
-            run_in.distance_km = min_distance_km
-        
-        # basic averages and session load (sRPE = minutes × RPE)[web:451][web:191]
-        avg_pace = (
-            run_in.duration_sec / run_in.distance_km
-            if run_in.distance_km > 0.001  # Minimum 1 meter to avoid division by very small numbers
-            else 0
-        )
-        
-        # Cap extremely high pace values (slower than 30 min/km is likely GPS error)
-        max_pace = 1800  # 30 minutes per km
-        if avg_pace > max_pace:
-            print(f"Warning: Very slow pace detected: {avg_pace:.0f}s/km. Capping at {max_pace}s/km")
-            avg_pace = max_pace
-        
-        rpe = run_in.rpe or 5
-        duration_min = run_in.duration_sec / 60
-        session_load = rpe * duration_min
-
-        # Convert GPS data to JSON format for storage
-        gps_route_json = []
-        if run_in.gps_route:
-            gps_route_json = [
-                {
-                    "lat": point.lat,
-                    "lng": point.lng,
-                    "timestamp": point.timestamp.isoformat(),
-                    "elevation": point.elevation,
-                    "speed": point.speed
-                }
-                for point in run_in.gps_route
-            ]
-
-        start_location_json = None
-        if run_in.start_location:
-            start_location_json = {
-                "lat": run_in.start_location.lat,
-                "lng": run_in.start_location.lng,
-                "address": run_in.start_location.address
-            }
-
-        end_location_json = None
-        if run_in.end_location:
-            end_location_json = {
-                "lat": run_in.end_location.lat,
-                "lng": run_in.end_location.lng,
-                "address": run_in.end_location.address
-            }
-
-        # Convert Heart Rate data to JSON format for storage
-        hr_data_json = []
-        if run_in.hr_data:
-            hr_data_json = [
-                {
-                    "bpm": point.bpm,
-                    "timestamp": point.timestamp.isoformat(),
-                    "zone": point.zone
-                }
-                for point in run_in.hr_data
-            ]
-
-        # Calculate HR statistics
-        avg_hr = None
-        max_hr = None
-        min_hr = None
-        hr_zones = None
-        
-        if run_in.hr_data:
-            bpms = [point.bpm for point in run_in.hr_data]
-            avg_hr = int(sum(bpms) / len(bpms))
-            max_hr = max(bpms)
-            min_hr = min(bpms)
-            
-            # Calculate time in each zone
-            zone_times = {}
-            for point in run_in.hr_data:
-                zone_times[point.zone] = zone_times.get(point.zone, 0) + 1
-            hr_zones = zone_times
-
-        # Convert splits data to JSON format for storage
-        splits_json = []
-        if run_in.splits:
-            splits_json = [
-                {
-                    "km": split.km,
-                    "distance_km": split.distance_km,
-                    "duration_sec": split.duration_sec,
-                    "pace_sec_per_km": split.pace_sec_per_km
-                }
-                for split in run_in.splits
-            ]
-
-        # Calculate calories burned
-        calories_burned = calculate_calories_burned(
-            distance_km=run_in.distance_km,
-            duration_sec=run_in.duration_sec,
-            weight_kg=run_in.weight_kg or 70.0,  # Default 70kg if not provided
-            avg_hr=avg_hr or run_in.avg_hr,
-            elevation_gain_m=run_in.elevation_gain_m
-        )
-
-        print(f"Creating run: {run_in.distance_km}km in {run_in.duration_sec}s (pace: {avg_pace:.0f}s/km, calories: {calories_burned})")
-
-        # Generate UUID manually to avoid potential issues
-        import uuid
-        run_id = str(uuid.uuid4())
-
-        db_run = CompletedRun(
-            id=run_id,
-            user_id=current_user.id,
-            planned_workout_id=run_in.planned_workout_id,
-            start_datetime=run_in.start_datetime,
-            distance_km=run_in.distance_km,
-            duration_sec=run_in.duration_sec,
-            avg_pace_s_per_km=avg_pace,
-            avg_hr=avg_hr or run_in.avg_hr,
-            rpe=run_in.rpe,
-            avg_cadence_spm=run_in.avg_cadence_spm,
-            notes=run_in.notes or "",
-            training_load=session_load,
-            calories_burned=calories_burned,  # Add calories to database
-            gps_route=gps_route_json or [],
-            start_location=start_location_json,
-            end_location=end_location_json,
-            elevation_gain_m=run_in.elevation_gain_m,
-            max_speed_kmh=run_in.max_speed_kmh,
-            hr_data=hr_data_json or [],
-            max_hr=max_hr or run_in.max_hr,
-            min_hr=min_hr or run_in.min_hr,
-            hr_zones=hr_zones,
-            splits=splits_json or [],
-        )
-        
-        db.add(db_run)
-        db.commit()
-        
-        print(f"✅ Run saved successfully: ID {run_id}")
-
-        # for now just return this session's load; dashboard will compute rolling loads[web:190][web:186]
-        return RunResponse(
-            run_id=run_id,
-            training_load=session_load,
-            load_7_day=session_load,
-            load_28_day=session_load,
-            calories_burned=calories_burned,  # Include calories in response
-        )
-    except ValueError as ve:
-        print(f"Validation error creating run: {str(ve)}")
-        print(f"Run data: {run_in}")
-        raise HTTPException(status_code=400, detail=f"Invalid run data: {str(ve)}")
-    except Exception as e:
-        print(f"Error creating run: {str(e)}")
-        print(f"Run data: {run_in}")
-        import traceback
-        traceback.print_exc()
+        update_challenge_progress(db, current_user.id)
+        new_achievements = check_and_award_achievements(current_user.id, db)
+    except Exception:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to create run: {str(e)}")
+        logger.exception("Post-run processing failed for run %s", db_run.id)
+
+    loads = rolling_loads(db, current_user.id, max(utcnow(), run_in.start_datetime))
+    return RunResponse(
+        run_id=db_run.id,
+        training_load=load,
+        load_7_day=loads["load_7d"],
+        load_28_day=loads["load_28d"],
+        calories_burned=calories_burned,
+        new_achievements=[a.name for a in new_achievements],
+    )
 
 
 @router.get("/", response_model=List[RunListItem])
 def list_runs(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -265,14 +204,11 @@ def list_runs(
         db.query(CompletedRun)
         .filter(CompletedRun.user_id == current_user.id)
         .order_by(CompletedRun.start_datetime.desc())
-        .limit(20)
+        .offset(skip)
+        .limit(limit)
         .all()
     )
 
-    def session_load(r: CompletedRun) -> float:
-        return (r.duration_sec / 60.0) * (r.rpe or 0)
-
-    # Convert to list of dicts to include training_load and start_location
     result = []
     for r in runs:
         start_location = None
@@ -282,14 +218,14 @@ def list_runs(
                 "lng": r.start_location["lng"],
                 "address": r.start_location.get("address")
             }
-        
+
         result.append({
             "id": r.id,
             "start_datetime": r.start_datetime,
             "distance_km": r.distance_km,
             "duration_sec": r.duration_sec,
-            "training_load": session_load(r),
-            "calories_burned": r.calories_burned,  # Include calories
+            "training_load": run_load(r),
+            "calories_burned": r.calories_burned,
             "start_location": start_location,
             "avg_hr": r.avg_hr
         })
@@ -315,7 +251,6 @@ def get_run_detail(
     # Convert JSON data back to proper format
     gps_route = []
     if run.gps_route:
-        from datetime import datetime
         gps_route = [
             {
                 "lat": point["lat"],
@@ -330,7 +265,6 @@ def get_run_detail(
     # Convert HR data back to proper format
     hr_data = []
     if run.hr_data:
-        from datetime import datetime
         hr_data = [
             {
                 "bpm": point["bpm"],

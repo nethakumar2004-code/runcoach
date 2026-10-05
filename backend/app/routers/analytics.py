@@ -2,14 +2,22 @@ from typing import List
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from app.db import get_db
 from app.models.user import User
 from app.models.run import CompletedRun
 from app.dependencies import get_current_user
+from app.services.training import MIN_DISTANCE_FOR_PACE_KM, run_load
+from app.timeutils import utcnow
 
 router = APIRouter()
+
+
+def average_pace(runs: List[CompletedRun]) -> float:
+    """Total time / total distance. Averaging each run's pace instead lets a 1 km jog count as much as a 20 km run."""
+    distance = sum(run.distance_km for run in runs)
+    return sum(run.duration_sec for run in runs) / distance if distance > 0 else 0.0
 
 @router.get("/advanced")
 def get_advanced_analytics(
@@ -19,7 +27,7 @@ def get_advanced_analytics(
     """Get advanced analytics including pace zones, trends, and race predictions with real-time metrics"""
     
     # Get user's runs from last 90 days for analysis
-    ninety_days_ago = datetime.utcnow() - timedelta(days=90)
+    ninety_days_ago = utcnow() - timedelta(days=90)
     recent_runs = db.query(CompletedRun).filter(
         CompletedRun.user_id == current_user.id,
         CompletedRun.start_datetime >= ninety_days_ago
@@ -72,7 +80,7 @@ def get_advanced_analytics(
     personal_records = calculate_personal_records(all_runs)
     
     # Calculate weekly summary
-    week_ago = datetime.utcnow() - timedelta(days=7)
+    week_ago = utcnow() - timedelta(days=7)
     weekly_runs = [run for run in recent_runs if run.start_datetime >= week_ago]
     weekly_summary = calculate_weekly_summary(weekly_runs)
     
@@ -94,7 +102,7 @@ def calculate_pace_zones(runs: List[CompletedRun]):
         return []
     
     # Calculate average pace for zone boundaries
-    avg_pace = sum(run.avg_pace_s_per_km for run in runs) / len(runs)
+    avg_pace = average_pace(runs)
     
     # Define pace zones based on average pace (non-overlapping ranges)
     zones = [
@@ -171,14 +179,14 @@ def calculate_performance_trends(runs: List[CompletedRun]):
         weekly_data[week_key]['runs'].append(run)
         weekly_data[week_key]['total_distance'] += run.distance_km
         weekly_data[week_key]['total_time'] += run.duration_sec
-        weekly_data[week_key]['total_load'] += run.training_load
+        weekly_data[week_key]['total_load'] += run_load(run)  # training_load can be NULL on old runs
     
     # Calculate trends for last 8 weeks
     trends = []
     for week_key in sorted(weekly_data.keys())[-8:]:
         data = weekly_data[week_key]
         if data['runs']:
-            avg_pace = sum(run.avg_pace_s_per_km for run in data['runs']) / len(data['runs'])
+            avg_pace = average_pace(data['runs'])
             trends.append({
                 "date": week_key,
                 "avg_pace": avg_pace,
@@ -188,54 +196,51 @@ def calculate_performance_trends(runs: List[CompletedRun]):
     
     return trends
 
+RIEGEL_EXPONENT = 1.06
+MIN_PREDICTION_RUN_KM = 3.0
+
+
+def riegel_time(known_time_sec: float, known_distance_km: float, target_distance_km: float) -> float:
+    """Pete Riegel's endurance formula: T2 = T1 x (D2 / D1) ^ 1.06"""
+    return known_time_sec * (target_distance_km / known_distance_km) ** RIEGEL_EXPONENT
+
+
+def format_duration(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours > 0 else f"{minutes}:{secs:02d}"
+
+
 def calculate_race_predictions(runs: List[CompletedRun]):
-    """Calculate race time predictions based on recent performance"""
-    if len(runs) < 3:
-        return []
-    
-    # Get runs from last 30 days for predictions
-    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-    recent_runs = [run for run in runs if run.start_datetime >= thirty_days_ago]
-    
-    if len(recent_runs) < 3:
-        return []
-    
-    # Calculate average pace from recent runs
-    avg_pace = sum(run.avg_pace_s_per_km for run in recent_runs) / len(recent_runs)
-    
-    # Race distance predictions with pace adjustments
-    race_distances = [
-        {"distance": "5K", "km": 5.0, "pace_factor": 0.95},  # 5% faster than training pace
-        {"distance": "10K", "km": 10.0, "pace_factor": 0.97}, # 3% faster than training pace
-        {"distance": "Half Marathon", "km": 21.1, "pace_factor": 1.05}, # 5% slower than training pace
-        {"distance": "Marathon", "km": 42.2, "pace_factor": 1.15}  # 15% slower than training pace
+    """Predict race times from the best recent effort using the Riegel formula.
+
+    Uses runs of 3 km+ from the last 30 days; for each race distance the fastest prediction wins,
+    because a training run is at most as fast as race effort.
+    """
+    thirty_days_ago = utcnow() - timedelta(days=30)
+    candidates = [
+        run for run in runs
+        if run.start_datetime >= thirty_days_ago and run.distance_km >= MIN_PREDICTION_RUN_KM and run.duration_sec > 0
     ]
-    
+    if not candidates:
+        return []
+
+    longest = max(run.distance_km for run in candidates)
+    race_distances = [("5K", 5.0), ("10K", 10.0), ("Half Marathon", 21.0975), ("Marathon", 42.195)]
+
     predictions = []
-    for race in race_distances:
-        predicted_pace = avg_pace * race["pace_factor"]
-        predicted_time_sec = predicted_pace * race["km"]
-        
-        # Calculate confidence based on training data
-        confidence = min(len(recent_runs) / 10.0, 1.0)  # Max confidence with 10+ runs
-        
-        # Format time
-        hours = int(predicted_time_sec // 3600)
-        minutes = int((predicted_time_sec % 3600) // 60)
-        seconds = int(predicted_time_sec % 60)
-        
-        if hours > 0:
-            time_str = f"{hours}:{minutes:02d}:{seconds:02d}"
-        else:
-            time_str = f"{minutes}:{seconds:02d}"
-        
+    for name, km in race_distances:
+        predicted = min(riegel_time(run.duration_sec, run.distance_km, km) for run in candidates)
+        # More runs = more confidence; predicting far beyond your longest run = less confidence
+        confidence = min(len(candidates) / 5.0, 1.0) * min(1.0, (longest * 2) / km)
         predictions.append({
-            "distance": race["distance"],
-            "predicted_time": time_str,
-            "confidence": confidence,
-            "based_on_runs": len(recent_runs)
+            "distance": name,
+            "predicted_time": format_duration(predicted),
+            "confidence": round(confidence, 2),
+            "based_on_runs": len(candidates)
         })
-    
+
     return predictions
 
 def calculate_personal_records(runs: List[CompletedRun]):
@@ -248,21 +253,19 @@ def calculate_personal_records(runs: List[CompletedRun]):
             "best_pace": 0
         }
     
-    # Find fastest 5K and 10K (approximate distances)
-    fastest_5k = None
-    fastest_10k = None
-    
-    for run in runs:
-        # 5K (4.5-5.5km range)
-        if 4.5 <= run.distance_km <= 5.5:
-            if fastest_5k is None or run.duration_sec < fastest_5k:
-                fastest_5k = run.duration_sec
-        
-        # 10K (9.5-10.5km range)
-        if 9.5 <= run.distance_km <= 10.5:
-            if fastest_10k is None or run.duration_sec < fastest_10k:
-                fastest_10k = run.duration_sec
-    
+    # A 5K record needs a run of (about) 5 km or more - a 4.5 km run's time is not a 5K time.
+    # 2% tolerance for GPS under-measuring; time is the run's average pace over the full distance.
+    def fastest_over(distance_km):
+        times = [
+            run.avg_pace_s_per_km * distance_km for run in runs
+            if run.distance_km >= distance_km * 0.98 and run.avg_pace_s_per_km
+        ]
+        return min(times) if times else None
+
+    fastest_5k = fastest_over(5.0)
+    fastest_10k = fastest_over(10.0)
+    pace_runs = [run.avg_pace_s_per_km for run in runs if run.distance_km >= MIN_DISTANCE_FOR_PACE_KM]
+
     # Format times
     def format_time(seconds):
         if seconds is None:
@@ -275,7 +278,7 @@ def calculate_personal_records(runs: List[CompletedRun]):
         "fastest_5k": format_time(fastest_5k),
         "fastest_10k": format_time(fastest_10k),
         "longest_run": max(run.distance_km for run in runs),
-        "best_pace": min(run.avg_pace_s_per_km for run in runs)
+        "best_pace": min(pace_runs) if pace_runs else 0
     }
 
 def calculate_weekly_summary(weekly_runs: List[CompletedRun]):
@@ -290,7 +293,7 @@ def calculate_weekly_summary(weekly_runs: List[CompletedRun]):
     
     total_distance = sum(run.distance_km for run in weekly_runs)
     total_time = sum(run.duration_sec for run in weekly_runs)
-    avg_pace = sum(run.avg_pace_s_per_km for run in weekly_runs) / len(weekly_runs)
+    avg_pace = average_pace(weekly_runs)
     
     return {
         "total_distance": total_distance,
@@ -339,7 +342,7 @@ def calculate_live_metrics(recent_runs: List[CompletedRun], weekly_runs: List[Co
     weekly_goal_progress = min((weekly_distance / weekly_distance_goal) * 100, 100) if weekly_distance_goal > 0 else 0
     
     # Calculate monthly progress
-    month_ago = datetime.utcnow() - timedelta(days=30)
+    month_ago = utcnow() - timedelta(days=30)
     monthly_runs = [run for run in recent_runs if run.start_datetime >= month_ago]
     monthly_distance = sum(run.distance_km for run in monthly_runs)
     monthly_distance_goal = 80.0  # 80km per month

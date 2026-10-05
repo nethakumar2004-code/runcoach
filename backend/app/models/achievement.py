@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Float, Text, Boolean
 from sqlalchemy.orm import relationship
 import uuid
-from datetime import datetime
+from app.timeutils import utcnow
 from app.db import Base
 
 class Achievement(Base):
@@ -23,7 +23,7 @@ class UserAchievement(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
     achievement_id = Column(String, ForeignKey("achievements.id"), nullable=False)
-    earned_at = Column(DateTime, default=datetime.utcnow)
+    earned_at = Column(DateTime, default=utcnow)
     progress = Column(Float, default=0.0)  # for tracking progress towards achievement
     
     # Relationships
@@ -52,4 +52,4 @@ class UserStats(Base):
     this_week_distance = Column(Float, default=0.0)
     this_month_distance = Column(Float, default=0.0)
     
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)

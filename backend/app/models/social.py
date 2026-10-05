@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Boolean, Text
 from sqlalchemy.orm import relationship
 import uuid
-from datetime import datetime
+from app.timeutils import utcnow
 from app.db import Base
 
 class Friendship(Base):
@@ -11,8 +11,8 @@ class Friendship(Base):
     requester_id = Column(String, ForeignKey("users.id"), nullable=False)
     addressee_id = Column(String, ForeignKey("users.id"), nullable=False)
     status = Column(String, nullable=False, default="pending")  # pending, accepted, blocked
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utcnow)
+    updated_at = Column(DateTime, nullable=False, default=utcnow, onupdate=utcnow)
 
     # Relationships
     requester = relationship("User", foreign_keys=[requester_id])
@@ -25,7 +25,7 @@ class ActivityFeed(Base):
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
     activity_type = Column(String, nullable=False)  # run_completed, achievement_earned, goal_achieved
     activity_data = Column(Text, nullable=True)  # JSON data about the activity
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utcnow)
     is_public = Column(Boolean, nullable=False, default=True)
 
     # Relationships
@@ -37,7 +37,7 @@ class ActivityLike(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     activity_id = Column(String, ForeignKey("activity_feed.id"), nullable=False)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utcnow)
 
     # Relationships
     activity = relationship("ActivityFeed")
@@ -50,7 +50,7 @@ class ActivityComment(Base):
     activity_id = Column(String, ForeignKey("activity_feed.id"), nullable=False)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
     comment_text = Column(Text, nullable=False)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utcnow)
 
     # Relationships
     activity = relationship("ActivityFeed")
@@ -68,7 +68,7 @@ class Challenge(Base):
     end_date = Column(DateTime, nullable=False)
     created_by = Column(String, ForeignKey("users.id"), nullable=False)
     is_public = Column(Boolean, nullable=False, default=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utcnow)
 
     # Relationships
     creator = relationship("User")
@@ -79,7 +79,7 @@ class ChallengeParticipant(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     challenge_id = Column(String, ForeignKey("challenges.id"), nullable=False)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
-    joined_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    joined_at = Column(DateTime, nullable=False, default=utcnow)
     current_progress = Column(Integer, nullable=False, default=0)
     completed = Column(Boolean, nullable=False, default=False)
 
@@ -94,7 +94,7 @@ class Kudos(Base):
     run_id = Column(String, ForeignKey("completed_runs.id"), nullable=False)
     giver_id = Column(String, ForeignKey("users.id"), nullable=False)
     receiver_id = Column(String, ForeignKey("users.id"), nullable=False)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utcnow)
 
     # Relationships
     run = relationship("CompletedRun")

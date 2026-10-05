@@ -51,7 +51,7 @@ class BadgeProgress(BaseModel):
 
 class UserProfile(BaseModel):
     user_id: str
-    name: str
+    name: Optional[str] = None
     email: str
     experience_level: Optional[str]
     stats: UserStatsResponse
