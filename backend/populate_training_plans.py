@@ -20,8 +20,9 @@ from app.models.workout import PlannedWorkout
 from app.models.achievement import Achievement, UserAchievement, UserStats
 from app.models.social import Friendship, ActivityFeed, ActivityLike, ActivityComment, Challenge, ChallengeParticipant, Kudos
 
-# Create all tables
-Base.metadata.create_all(bind=engine)
+# Create / upgrade all tables
+from app.migrations import run_migrations
+run_migrations()
 
 def create_sample_plans():
     db = SessionLocal()

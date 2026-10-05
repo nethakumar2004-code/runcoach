@@ -6,12 +6,11 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from app.db import Base, engine
-from app.models import user, goal, workout, run, achievement, social, training_plan, weather
+from app.migrations import run_migrations
 
 def init_database():
-    print("Creating database tables...")
-    Base.metadata.create_all(bind=engine)
+    print("Creating / upgrading database tables...")
+    run_migrations()
     print("Database tables created successfully!")
 
 if __name__ == "__main__":

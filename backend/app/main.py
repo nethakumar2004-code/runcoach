@@ -8,7 +8,8 @@ from fastapi.responses import JSONResponse
 
 from app import config
 from app import models  # noqa: F401  registers every table
-from app.db import Base, SessionLocal, engine
+from app.db import SessionLocal
+from app.migrations import run_migrations
 from app.routers import runs, dashboard, auth, achievements, social, analytics, training_plans, weather
 from app.services.achievements import initialize_default_achievements
 
@@ -18,7 +19,7 @@ logger = logging.getLogger("runcoach")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    run_migrations()
     with SessionLocal() as db:
         initialize_default_achievements(db)
     if config.DEV_MODE:

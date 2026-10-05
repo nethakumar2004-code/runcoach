@@ -20,6 +20,8 @@ from app.main import app  # noqa: E402
 @pytest.fixture()
 def client():
     Base.metadata.drop_all(bind=engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP TABLE IF EXISTS alembic_version")
     with TestClient(app, raise_server_exceptions=False) as test_client:  # runs startup: tables + achievements
         yield test_client
 

@@ -111,6 +111,14 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 The database is always `backend/dev.db`, no matter which folder you start the server from.
 
+### Changing the database (migrations)
+The server brings the database up to date automatically when it starts. When you change a model in `backend/app/models/`:
+```bash
+cd backend
+alembic revision --autogenerate -m "add nickname to users"   # writes a file in migrations/versions/
+```
+Open the new file and check it does what you expect, then restart the server and commit the file together with the model change. If you forget, the `test_migrations_match_the_models` test fails and tells you.
+
 ### Running the tests
 ```bash
 cd backend
